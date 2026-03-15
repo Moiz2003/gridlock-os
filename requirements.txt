@@ -1,0 +1,28 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# GridLock OS — Python Dependencies
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Scheduling — 5-minute heartbeat loop
+schedule==1.2.2
+
+# HTTP — OpenWeatherMap and Panasonic Comfort Cloud REST calls
+requests==2.32.3
+
+# Inverex/Deye local Modbus TCP over Solarman Wi-Fi dongle (port 8899)
+pysolarmanv5
+
+# Gree AC — local-network UDP control protocol
+greeclimate==1.4.1
+
+# Panasonic Comfort Cloud — unofficial API wrapper
+pcomfortcloud==0.0.27
+
+# InfluxDB — time-series data writer
+influxdb-client==1.44.0
+
+# Environment variables — safe loading of the .env file
+python-dotenv==1.0.1
+
+# Predictive model inference
+numpy==1.26.4
+joblib==1.4.2

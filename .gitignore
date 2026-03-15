@@ -1,0 +1,38 @@
+# =============================================================================
+# GridLock OS — .gitignore
+# =============================================================================
+
+# --- Security: NEVER push secrets ---
+.env
+
+# --- Python virtual environments ---
+venv/
+.venv/
+env/
+ENV/
+
+# --- Python cache files ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+
+# --- Distribution / packaging ---
+dist/
+build/
+*.egg-info/
+
+# --- IDE and editor files ---
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# --- Logs ---
+*.log
+logs/
+
+# --- Docker volumes (if mounted locally) ---
+influxdb_data/
+grafana_data/
