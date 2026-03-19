@@ -16,8 +16,9 @@ Public API:
 import logging
 import socket
 from dataclasses import dataclass
+from time import monotonic, sleep
 
-from pysolarmanv5 import PySolarmanV5
+from pysolarmanv5 import NoSocketAvailableError, PySolarmanV5
 
 import config
 
@@ -29,6 +30,9 @@ _REG_PV1_POWER_W = 186          # PV1 power (W)
 _REG_PV2_POWER_W = 187          # PV2 power (W)
 _REG_TOTAL_LOAD_POWER_W = 178   # Total load power (W)
 
+_NETWORK_PARTITION_BACKOFF_SECONDS = 30
+_NEXT_RECONNECT_AT_MONOTONIC: float | None = None
+
 
 @dataclass(frozen=True)
 class SolarTelemetry:
@@ -36,6 +40,23 @@ class SolarTelemetry:
     soc: float          # Battery state of charge, 0–100 %
     pv_yield_kw: float  # Present PV generation in kilowatts
     load_kw: float      # Present household consumption in kilowatts
+    ac_output_power_kw: float | None = None
+    daily_pv_energy_kwh: float | None = None
+    daily_load_energy_kwh: float | None = None
+    total_energy_kwh: float | None = None
+    inverter_efficiency: float | None = None
+
+
+def _zero_telemetry() -> SolarTelemetry:
+    return SolarTelemetry(soc=0.0, pv_yield_kw=0.0, load_kw=0.0)
+
+
+def _is_network_partition_error(exc: Exception) -> bool:
+    if isinstance(exc, NoSocketAvailableError):
+        return True
+    if isinstance(exc, OSError) and exc.errno == 101:
+        return True
+    return False
 
 
 def _read_s16(inverter: PySolarmanV5, register: int) -> int:
@@ -47,42 +68,124 @@ def _read_s16(inverter: PySolarmanV5, register: int) -> int:
     return value if value < 32768 else value - 65536
 
 
+def _read_u16_optional(inverter: PySolarmanV5, register: int | None, scale: float = 1.0) -> float | None:
+    if register is None:
+        return None
+    try:
+        values = inverter.read_holding_registers(register, 1)
+        if not values:
+            return None
+        raw = int(values[0])
+        return max(0.0, raw * scale)
+    except Exception as exc:
+        log.debug("Optional register read failed (reg=%s): %s", register, exc)
+        return None
+
+
 def get_telemetry() -> SolarTelemetry:
     """Reads local Deye/Inverex telemetry via the Solarman Wi-Fi dongle."""
-    inverter = PySolarmanV5(
-        config.INVERTER_IP,
-        config.INVERTER_SERIAL,
-        port=config.INVERTER_PORT,
-    )
+    global _NEXT_RECONNECT_AT_MONOTONIC
 
-    try:
-        battery_soc = float(_read_s16(inverter, _REG_BATTERY_SOC))
-        pv1_w = _read_s16(inverter, _REG_PV1_POWER_W)
-        pv2_w = _read_s16(inverter, _REG_PV2_POWER_W)
-        load_w = _read_s16(inverter, _REG_TOTAL_LOAD_POWER_W)
+    now_monotonic = monotonic()
+    if _NEXT_RECONNECT_AT_MONOTONIC is not None and now_monotonic < _NEXT_RECONNECT_AT_MONOTONIC:
+        wait_s = max(1, int(_NEXT_RECONNECT_AT_MONOTONIC - now_monotonic))
+        log.warning("[INVERTER_BACKOFF] Network partition backoff active; reconnect retry in ~%ss", wait_s)
+        return _zero_telemetry()
 
-        telemetry = SolarTelemetry(
-            soc=max(0.0, min(100.0, battery_soc)),
-            pv_yield_kw=max(0.0, (pv1_w + pv2_w) / 1000.0),
-            load_kw=max(0.0, load_w / 1000.0),
-        )
-        log.debug("Telemetry via local Modbus: %s", telemetry)
-        return telemetry
+    for attempt in range(1, 4):
+        inverter = None
+        try:
+            inverter = PySolarmanV5(
+                config.INVERTER_IP,
+                config.INVERTER_SERIAL,
+                port=config.INVERTER_PORT,
+                auto_reconnect=True,
+                socket_timeout=15,
+            )
 
-    except (TimeoutError, socket.timeout) as exc:
-        raise RuntimeError(
-            "Inverter telemetry timeout via local Modbus (dongle may be offline)."
-        ) from exc
-    except OSError as exc:
-        raise RuntimeError(f"Inverter telemetry socket error: {exc}") from exc
-    finally:
-        # Some versions expose close(), others disconnect(); support both safely.
-        close_fn = getattr(inverter, "close", None) or getattr(inverter, "disconnect", None)
-        if callable(close_fn):
-            try:
-                close_fn()
-            except Exception:
-                pass
+            battery_soc = float(_read_s16(inverter, _REG_BATTERY_SOC))
+            pv1_w = _read_s16(inverter, _REG_PV1_POWER_W)
+            pv2_w = _read_s16(inverter, _REG_PV2_POWER_W)
+            load_w = _read_s16(inverter, _REG_TOTAL_LOAD_POWER_W)
+
+            telemetry = SolarTelemetry(
+                soc=max(0.0, min(100.0, battery_soc)),
+                pv_yield_kw=max(0.0, (pv1_w + pv2_w) / 1000.0),
+                load_kw=max(0.0, load_w / 1000.0),
+            )
+
+            ac_output_power_w = _read_u16_optional(
+                inverter,
+                config.INVERTER_REG_AC_OUTPUT_POWER_W,
+                config.INVERTER_AC_OUTPUT_POWER_SCALE,
+            )
+            ac_output_power_kw = (ac_output_power_w / 1000.0) if ac_output_power_w is not None else None
+
+            daily_pv_energy_kwh = _read_u16_optional(
+                inverter,
+                config.INVERTER_REG_DAILY_PV_ENERGY_KWH,
+                config.INVERTER_DAILY_PV_ENERGY_SCALE,
+            )
+            daily_load_energy_kwh = _read_u16_optional(
+                inverter,
+                config.INVERTER_REG_DAILY_LOAD_ENERGY_KWH,
+                config.INVERTER_DAILY_LOAD_ENERGY_SCALE,
+            )
+            total_energy_kwh = _read_u16_optional(
+                inverter,
+                config.INVERTER_REG_TOTAL_ENERGY_KWH,
+                config.INVERTER_TOTAL_ENERGY_SCALE,
+            )
+
+            inverter_efficiency = None
+            if ac_output_power_kw is not None and telemetry.pv_yield_kw > 0:
+                inverter_efficiency = max(0.0, ac_output_power_kw / telemetry.pv_yield_kw)
+
+            telemetry = SolarTelemetry(
+                soc=telemetry.soc,
+                pv_yield_kw=telemetry.pv_yield_kw,
+                load_kw=telemetry.load_kw,
+                ac_output_power_kw=ac_output_power_kw,
+                daily_pv_energy_kwh=daily_pv_energy_kwh,
+                daily_load_energy_kwh=daily_load_energy_kwh,
+                total_energy_kwh=total_energy_kwh,
+                inverter_efficiency=inverter_efficiency,
+            )
+            _NEXT_RECONNECT_AT_MONOTONIC = None
+            log.debug("Telemetry via local Modbus: %s", telemetry)
+            return telemetry
+
+        except (NoSocketAvailableError, TimeoutError, socket.timeout, OSError) as exc:
+            if _is_network_partition_error(exc):
+                _NEXT_RECONNECT_AT_MONOTONIC = monotonic() + _NETWORK_PARTITION_BACKOFF_SECONDS
+                if attempt < 3:
+                    log.warning(
+                        "Inverter network partition detected (attempt %d/3): %s. "
+                        "Waiting %ss before re-initializing client.",
+                        attempt,
+                        exc,
+                        _NETWORK_PARTITION_BACKOFF_SECONDS,
+                    )
+                    sleep(_NETWORK_PARTITION_BACKOFF_SECONDS)
+                    continue
+                log.warning("[INVERTER_OFFLINE] Network partition persists after retries: %s", exc)
+                break
+
+            if attempt < 3:
+                log.warning("Inverter telemetry read failed (attempt %d/3): %s", attempt, exc)
+                sleep(2)
+            else:
+                log.warning("[INVERTER_OFFLINE] Returning zeroed telemetry after 3 failed attempts: %s", exc)
+        finally:
+            # Some versions expose close(), others disconnect(); support both safely.
+            close_fn = getattr(inverter, "close", None) or getattr(inverter, "disconnect", None)
+            if callable(close_fn):
+                try:
+                    close_fn()
+                except Exception:
+                    pass
+
+    return _zero_telemetry()
 
 
 def get_battery_soc() -> float:

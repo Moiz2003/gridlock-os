@@ -5,7 +5,7 @@ services:
   gridlock-app:
     build: .
     container_name: gridlock-app
-    restart: unless-stopped
+    restart: always
     env_file:
       - .env
     depends_on:
