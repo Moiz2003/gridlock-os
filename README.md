@@ -13,6 +13,8 @@ GRIDLOCK OS continuously reads inverter, weather, and AC state telemetry, predic
 - Panasonic integration: currently offline due Comfort Cloud API auth/version response (`401`, code `4106`).
 - Inverter telemetry: live Modbus reads with network-partition backoff handling.
 - Influx schema: flattened HVAC fields + data quality flags + optional research metrics.
+- ML training pipeline: complete (`src/ml/train_xgboost.py`) with model + feature importance artifacts.
+- ML inference pipeline: complete (`src/ml/predict_xgboost.py`) with live Influx-backed 1-hour SoC prediction.
 
 ## What The System Does Today
 
@@ -25,6 +27,7 @@ GRIDLOCK OS continuously reads inverter, weather, and AC state telemetry, predic
    - passive guard (no control packets),
    - manual override yield mode (cooldown).
 7. Persists all snapshots into InfluxDB (`gridlock_snapshot`).
+8. Trains and serves an XGBoost 1-hour-ahead battery SoC predictor as a standalone ML module.
 
 ## Architecture
 
@@ -71,6 +74,42 @@ flowchart LR
 
 - `src/db/time_series.py`
   - single Influx write surface, flattened fields, quality flags, retry-on-write-failure.
+
+- `src/ml/train_xgboost.py`
+  - end-to-end training pipeline: load/clean/impute, feature engineering, chronological split, MAE report, model/plot artifacts.
+
+- `src/ml/predict_xgboost.py`
+  - standalone inference pipeline: last-20m Influx query, lag feature extraction, feature alignment to model, robust fallback handling.
+
+## ML Pipeline (New)
+
+### Training
+
+- Input dataset: `gridlock_research_export.csv`.
+- Time-aware features:
+  - `hour_sin`, `hour_cos` (circular hour encoding)
+  - `battery_soc_lag_15m`, `load_kw_lag_15m`
+- Target: `target_soc_1h = battery_soc.shift(-12)` for 5-minute cadence.
+- Split strategy: chronological 80/20 (no shuffle).
+- Model: `xgboost.XGBRegressor`.
+
+Latest observed training metric (3-day dummy set):
+- `MAE: 14.1904`
+
+Artifacts:
+- `src/ml/models/xgboost_soc_v1.json`
+- `src/ml/models/feature_importance.png`
+
+### Standalone Inference
+
+- Function: `predict_next_hour_soc(client: InfluxDBClient) -> float`
+- Live window: last `20m` from InfluxDB.
+- Reuses training-compatible cleaning and feature logic.
+- Aligns inference columns to model feature names before prediction.
+- Handles missing telemetry with warnings + safe fallbacks (ffill/median/zero where applicable).
+
+Example output:
+- `[AI PREDICTION] Battery SoC in 1 Hour: 98.0%`
 
 ## Safety and Reliability Features
 
@@ -208,6 +247,21 @@ docker compose logs -f --tail 120 gridlock-app
 docker compose ps
 ```
 
+### Train XGBoost Model
+
+```bash
+/home/moiz/gridlock-os/.venv/bin/python src/ml/train_xgboost.py \
+  --data-path gridlock_research_export.csv \
+  --model-path src/ml/models/xgboost_soc_v1.json \
+  --plot-path src/ml/models/feature_importance.png
+```
+
+### Run Standalone AI Inference
+
+```bash
+/home/moiz/gridlock-os/.venv/bin/python src/ml/predict_xgboost.py
+```
+
 ## Known Issues
 
 - Panasonic listener currently fails with:
@@ -215,6 +269,7 @@ docker compose ps
   - response code `4106` (`New version app has been published`)
 - Gree can intermittently timeout on direct standalone probe scripts; engine path now handles this better with backoff + cache logic.
 - Research-grade energy counters are wired but remain `None` until verified register mapping is provided.
+- XGBoost inference currently runs as a standalone script; runtime `engine.py` integration is pending by design.
 
 ## Research Objective and Roadmap
 
@@ -224,17 +279,19 @@ docker compose ps
 - Resilient hardware integration with retries/backoff/fallbacks.
 - Passive-safe operation mode for controlled bake period.
 - Clean timeseries schema suitable for forecasting and optimization research.
+- XGBoost training pipeline and standalone live inference pipeline implemented and validated.
 
 ### Next Milestones
 
 1. Register verification for daily/lifetime energy counters.
 2. Grafana dashboards for quality and health metrics.
 3. A/B baseline reports from bake dataset.
-4. Day-15 planner integration (hybrid architecture):
+4. Runtime integration of XGBoost inference into `engine.py` with safe fallback path.
+5. Day-15 planner integration (hybrid architecture):
    - XGBoost forecast layer,
    - finite-horizon planner (A* / dynamic programming over SoC state trajectory),
    - CSP safety constraints (comfort, minimum battery reserve, override lockout).
-5. Closed-loop optimization evaluation:
+6. Closed-loop optimization evaluation:
    - cost reduction,
    - self-consumption increase,
    - SoC reliability and comfort stability.
